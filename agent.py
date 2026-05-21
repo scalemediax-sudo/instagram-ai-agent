@@ -1,5 +1,7 @@
 import os
-from groq import Groq
+import httpx
+
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 CALENDLY_LINK = os.getenv("CALENDLY_LINK", "https://calendly.com/your-link-here")
 MIN_BUDGET = int(os.getenv("MIN_BUDGET", "500"))
@@ -38,10 +40,10 @@ RULES:
 
 class LeadQualificationAgent:
     def __init__(self):
-        self.client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+        self.api_key = os.getenv("GROQ_API_KEY")
+        if not self.api_key:
+            raise ValueError("GROQ_API_KEY environment variable is not set")
         self.model = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
-        # In-memory conversation store: user_id -> list of messages
-        # For production scale, swap this with Redis
         self.conversations: dict[str, list[dict]] = {}
 
     async def process_message(self, user_id: str, message: str) -> str:
@@ -50,26 +52,36 @@ class LeadQualificationAgent:
 
         self.conversations[user_id].append({"role": "user", "content": message})
 
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=[
+        payload = {
+            "model": self.model,
+            "messages": [
                 {"role": "system", "content": SYSTEM_PROMPT},
                 *self.conversations[user_id],
             ],
-            temperature=0.7,
-            max_tokens=300,
-        )
+            "temperature": 0.7,
+            "max_tokens": 300,
+        }
 
-        reply = response.choices[0].message.content.strip()
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                GROQ_API_URL,
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+            )
+            response.raise_for_status()
+            data = response.json()
+
+        reply = data["choices"][0]["message"]["content"].strip()
 
         self.conversations[user_id].append({"role": "assistant", "content": reply})
 
-        # Keep last 30 messages to avoid token overflow
         if len(self.conversations[user_id]) > 30:
             self.conversations[user_id] = self.conversations[user_id][-30:]
 
         return reply
 
     def reset_conversation(self, user_id: str):
-        """Clear conversation history for a user (e.g. after they book or opt out)."""
         self.conversations.pop(user_id, None)
